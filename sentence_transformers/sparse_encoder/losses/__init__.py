@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .csr import CSRLoss, CSRReconstructionLoss
 from .flops import FlopsLoss
+from .sae_splade import SAESpladeReconstructionLoss
 from .sparse_angle import SparseAnglELoss
 from .sparse_cosent import SparseCoSENTLoss
 from .sparse_cosine_similarity import SparseCosineSimilarityLoss
@@ -18,6 +19,7 @@ __all__ = [
     "CachedSpladeLoss",
     "CSRLoss",
     "CSRReconstructionLoss",
+    "SAESpladeReconstructionLoss",
     "SparseMultipleNegativesRankingLoss",
     "SparseCoSENTLoss",
     "SparseTripletLoss",

@@ -356,9 +356,13 @@ class SparseAutoEncoder(Module):
     ) -> dict[str, torch.Tensor]:
         k = max_active_dims if max_active_dims is not None else self.k
         keys = self._FEATURE_KEYS[self.mode]
-        x = features[keys["input"]]
-
-        x, info = self.prepare(x)
+        original = features[keys["input"]]
+        # The reconstruction loss compares its target against the *decoded* output, which
+        # :meth:`decode` returns on the original (denormalised) scale. So the target stored
+        # as ``keys["backbone"]`` must also be the original input, not the post-prepare
+        # normalised tensor — otherwise MSE happens across mismatched scales when
+        # normalize=True. Capture it before :meth:`prepare` rewrites ``x``.
+        x, info = self.prepare(original)
         latents_pre_act = self.encode_pre_act(x)
 
         # In splade mode the user may skip the top-K mask entirely; csr mode always uses
@@ -396,7 +400,7 @@ class SparseAutoEncoder(Module):
         # Update the features dictionary
         features.update(
             {
-                keys["backbone"]: x,
+                keys["backbone"]: original,
                 keys["encoded"]: latents_pre_act,
                 keys["encoded_4k"]: latents_4k,
                 keys["auxiliary"]: latents_auxk,
