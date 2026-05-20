@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Literal
 
 try:
@@ -43,12 +44,15 @@ class SparseAutoEncoder(Module):
     forward path from `From Tokens to Concepts: Leveraging SAE for SPLADE
     <https://huggingface.co/papers/2604.21511>`_.
 
-    The encoder math is the same in both modes (pre-bias, tied decoder, top-K, AuxK,
-    dead-neuron stats); only the I/O contract differs:
+    The encoder math is the same in both modes (pre-bias, top-K, AuxK,
+    dead-neuron stats); only the I/O contract — and a handful of splade-specific
+    details around the decoder and normalisation — differ:
 
     * ``mode="csr"`` (default) — the CSR pipeline. Reads a per-sentence vector from
       ``features["sentence_embedding"]`` of shape ``(batch, input_dim)`` and writes a
       top-K sparse vector back to the same key (shape ``(batch, hidden_dim)``).
+      Uses a tied decoder (``W_dec = W_enc.T``) and, when ``normalize=True``,
+      per-token LayerNorm.
     * ``mode="splade"`` — the SAE-SPLADE pipeline. Reads per-token hidden states from
       ``features["token_embeddings"]`` of shape ``(batch, seq_length, input_dim)`` and
       writes top-K SAE latents back to the same key (shape
@@ -56,6 +60,22 @@ class SparseAutoEncoder(Module):
       :class:`SpladePooling`. In this mode ``k=0`` (or any value ``>= hidden_dim``)
       skips the top-K mask entirely — sparsity is then produced by the downstream
       ReLU + log1p + max-pool, as in the SPLADE fine-tuning phase of the paper.
+
+      Splade-mode-only architecture differences from csr:
+
+      * **Untied, row-normalised decoder.** A separate ``W_dec`` parameter (shape
+        ``(hidden_dim, input_dim)``); each row is L2-normalised so concepts live on
+        the unit sphere. A backward hook on ``W_dec`` strips the gradient component
+        parallel to each row; :meth:`normalize_decoder_` restores unit norm after
+        each optimizer step (use :class:`SpladeDecoderNormalizationCallback` to do
+        this automatically during training).
+      * **Corpus-level normalisation** (``normalize=True``). Persistent buffers
+        ``mean_bias`` (per-dim corpus mean) and ``mean_norm`` (scalar mean L2 of
+        mean-centered tokens); populated by :meth:`init_corpus_normalization`.
+        The decoder undoes both during reconstruction so SAE losses see original
+        magnitudes; the externally-written ``token_embeddings`` are rescaled by
+        ``mean_norm`` so the downstream :class:`SpladePooling`'s ``log1p`` sees a
+        sensible dynamic range.
 
     Training-mode forward exposes the usual reconstruction / auxiliary intermediates
     under prefixes that match the mode (``sentence_embedding_*`` /
@@ -124,11 +144,30 @@ class SparseAutoEncoder(Module):
         self.pre_bias = nn.Parameter(torch.zeros(input_dim))
         self.encoder: nn.Module = nn.Linear(input_dim, hidden_dim, bias=False)
         self.latent_bias = nn.Parameter(torch.zeros(hidden_dim))
-        self.decoder: TiedTranspose = TiedTranspose(self.encoder)
         self.k = k
         self.k_aux = k_aux
         self.normalize = normalize
         self.mode = mode
+
+        if mode == "splade":
+            # Untied decoder: a separate parameter, row-normalized so each "concept"
+            # row is a unit vector in input space. Paired with the parallel-gradient
+            # hook below + the renormalization callback after each optimizer step,
+            # this keeps every row on the unit sphere throughout training.
+            self.W_dec = nn.Parameter(torch.empty(hidden_dim, input_dim))
+            self._init_untied_decoder()
+            self.W_dec.register_hook(self._strip_parallel_gradient)
+            self.decoder = None  # untied; use self.W_dec directly via :meth:`decode`
+
+            if normalize:
+                # Corpus-level normalization buffers. Identity defaults; the user
+                # populates them via :meth:`init_corpus_normalization` before
+                # training. These are persistent so they round-trip through
+                # ``save`` / ``load``.
+                self.register_buffer("mean_bias", torch.zeros(input_dim))
+                self.register_buffer("mean_norm", torch.tensor(1.0))
+        else:
+            self.decoder: TiedTranspose = TiedTranspose(self.encoder)
 
         self.stats_last_nonzero: torch.Tensor
         self.register_buffer("stats_last_nonzero", torch.zeros(hidden_dim, dtype=torch.long))
@@ -139,6 +178,86 @@ class SparseAutoEncoder(Module):
             return x
 
         self.auxk_mask_fn = auxk_mask_fn
+
+    @torch.no_grad()
+    def _init_untied_decoder(self) -> None:
+        """Initialise ``W_dec`` from the encoder weight (tied init) and row-normalise.
+
+        ``encoder.weight`` is initialised by ``nn.Linear`` to kaiming-uniform; we copy
+        it into ``W_dec`` and then L2-normalise each row so concepts start on the unit
+        sphere. Matches the reference SAE-SPLADE init.
+        """
+        self.W_dec.copy_(self.encoder.weight.data)
+        self.W_dec.copy_(F.normalize(self.W_dec, dim=-1))
+
+    def _strip_parallel_gradient(self, grad: torch.Tensor) -> torch.Tensor:
+        """Backward hook: remove the component of ``W_dec.grad`` parallel to each row.
+
+        Combined with :meth:`normalize_decoder_` after every optimizer step, this is
+        equivalent to taking a Riemannian SGD step on the unit-norm constraint surface
+        — radial gradient components would just be undone by renormalisation anyway,
+        so we strip them to make training more stable.
+        """
+        weight_normalized = F.normalize(self.W_dec.detach(), dim=-1)
+        parallel = (grad * weight_normalized).sum(dim=-1, keepdim=True)
+        return grad - parallel * weight_normalized
+
+    @torch.no_grad()
+    def normalize_decoder_(self) -> None:
+        """Row-normalise ``W_dec`` in place. No-op in csr mode (no untied decoder).
+
+        Should be called after every optimizer step; the bundled
+        :class:`SpladeDecoderNormalizationCallback` does this automatically.
+        """
+        if self.mode != "splade":
+            return
+        self.W_dec.copy_(F.normalize(self.W_dec, dim=-1))
+
+    @torch.no_grad()
+    def init_corpus_normalization(self, batches: Iterable[tuple[torch.Tensor, torch.Tensor | None]]) -> None:
+        """Populate ``mean_bias`` / ``mean_norm`` from a streaming corpus pass.
+
+        Computes the per-dim mean of valid tokens (``mean_bias``) and the mean L2
+        norm of mean-centered valid tokens (``mean_norm``). Run this once on a
+        representative slice of the corpus before training, with the backbone in
+        eval mode. Only valid in splade mode with ``normalize=True``.
+
+        Args:
+            batches: iterable of ``(hidden_states, attention_mask)`` pairs.
+                ``hidden_states`` has shape ``(batch, seq_length, input_dim)``;
+                ``attention_mask`` is ``(batch, seq_length)`` (or ``None`` to use
+                every token). Hidden states should already have any punctuation /
+                special tokens masked out of ``attention_mask`` if you want them
+                excluded from the statistic, matching the reference recipe.
+        """
+        if self.mode != "splade" or not self.normalize:
+            raise RuntimeError("init_corpus_normalization is only available when mode='splade' and normalize=True")
+
+        mean_bias = torch.zeros_like(self.mean_bias)
+        mean_norm = torch.zeros_like(self.mean_norm)
+        total = 0
+
+        for hidden_states, attention_mask in batches:
+            if attention_mask is None:
+                valid = hidden_states.reshape(-1, hidden_states.shape[-1])
+            else:
+                valid = hidden_states[attention_mask.bool()]
+            n = valid.shape[0]
+            if n == 0:
+                continue
+            batch_mean = valid.to(mean_bias.dtype).mean(dim=0)
+            batch_norm = (valid.to(mean_bias.dtype) - batch_mean).norm(dim=-1).mean()
+            # Streaming average across batches.
+            ratio = total / (total + n)
+            mean_bias = ratio * mean_bias + (1 - ratio) * batch_mean
+            mean_norm = ratio * mean_norm + (1 - ratio) * batch_norm
+            total += n
+
+        if total == 0:
+            raise ValueError("init_corpus_normalization received no valid tokens")
+
+        self.mean_bias.copy_(mean_bias)
+        self.mean_norm.copy_(mean_norm)
 
     def encode_pre_act(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -161,6 +280,12 @@ class SparseAutoEncoder(Module):
     def prepare(self, x: torch.Tensor):
         if not self.normalize:
             return x, dict()
+        if self.mode == "splade":
+            # Corpus-level normalisation: subtract per-dim corpus mean, divide by
+            # the scalar mean L2 norm. Identity if the buffers haven't been
+            # populated yet (defaults: mean_bias=0, mean_norm=1).
+            return (x - self.mean_bias) / self.mean_norm, dict()
+        # csr mode: per-token LayerNorm, info stashed so :meth:`decode` can undo it.
         x, mu, std = self.LN(x)
         return x, dict(mu=mu, std=std)
 
@@ -204,9 +329,18 @@ class SparseAutoEncoder(Module):
         :param latents: autoencoder latents (shape: [batch, hidden_dim])
         :return: reconstructed data (shape: [batch, n_inputs])
         """
+        if self.mode == "splade":
+            # Untied: F.linear(x, W) computes x @ W.T, so passing W_dec gives latents @ W_dec.T,
+            # which is wrong; we want latents @ W_dec. Pass W_dec.t() so the shapes line up.
+            ret = F.linear(latents, self.W_dec.t(), None) + self.pre_bias
+            if self.normalize:
+                # Undo corpus normalisation to bring the reconstruction back to the
+                # original hidden-state scale.
+                ret = ret * self.mean_norm + self.mean_bias
+            return ret
 
+        # csr mode: tied decoder + per-token LayerNorm undo.
         ret = self.decoder(latents) + self.pre_bias
-
         if self.normalize:
             assert info is not None
             ret = ret * info["std"] + info["mu"]
@@ -231,10 +365,20 @@ class SparseAutoEncoder(Module):
         # top-K because top-K is the only thing producing sparsity in that pipeline.
         skip_topk = self.mode == "splade" and self._topk_disabled(k)
 
+        # In splade mode the SAE input is on the *normalised* scale, which means the
+        # encoder's output magnitudes are also small. Downstream :class:`SpladePooling`
+        # needs original-scale values so its ``log1p`` doesn't squash everything;
+        # rescale the externally-written latents by ``mean_norm`` to restore it.
+        # The internal ``latents_k`` stays on the normalised scale so :meth:`decode`
+        # — which itself denormalises in splade+normalize — round-trips correctly.
+        output_scale = self.mean_norm if (self.mode == "splade" and self.normalize) else None
+
         # If the model is in inference mode, we don't need to e.g. compute the 4k, auxk, or apply the decoder
         if torch.is_inference_mode_enabled():
-            latents_k = torch.relu(latents_pre_act) if skip_topk else self.top_k(latents_pre_act, k, compute_aux=False)[0]
-            features[keys["input"]] = latents_k
+            latents_k = (
+                torch.relu(latents_pre_act) if skip_topk else self.top_k(latents_pre_act, k, compute_aux=False)[0]
+            )
+            features[keys["input"]] = latents_k if output_scale is None else latents_k * output_scale
             return features
 
         if skip_topk:
@@ -262,7 +406,7 @@ class SparseAutoEncoder(Module):
                 keys["decoded_k_pre_bias"]: recons_k - self.pre_bias,
             }
         )
-        features[keys["input"]] = latents_k
+        features[keys["input"]] = latents_k if output_scale is None else latents_k * output_scale
         return features
 
     def save(self, output_path, safe_serialization: bool = True) -> None:

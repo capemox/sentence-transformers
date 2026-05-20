@@ -3,12 +3,51 @@ from __future__ import annotations
 import logging
 from enum import Enum
 
+import torch.nn as nn
 from transformers.trainer_callback import TrainerCallback, TrainerControl, TrainerState
 
 from sentence_transformers.sparse_encoder.losses.splade import SpladeLoss
+from sentence_transformers.sparse_encoder.modules.sparse_auto_encoder import SparseAutoEncoder
 from sentence_transformers.sparse_encoder.training_args import SparseEncoderTrainingArguments
 
 logger = logging.getLogger(__name__)
+
+
+class SpladeDecoderNormalizationCallback(TrainerCallback):
+    """Renormalises every splade-mode :class:`SparseAutoEncoder`'s decoder weights
+    to unit row-norm after each optimizer step.
+
+    Pairs with the parallel-gradient-stripping hook on ``W_dec`` so the decoder
+    rows stay on the unit sphere throughout training — the constraint that makes
+    each learned latent a well-defined "concept direction" in hidden space.
+
+    Required for ``SparseAutoEncoder(mode="splade")`` modules; csr-mode SAEs are
+    safely no-op'd by the underlying :meth:`SparseAutoEncoder.normalize_decoder_`.
+
+    Args:
+        model: The model whose modules should be scanned for splade-mode SAEs.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self._splade_saes = [
+            module for module in model.modules() if isinstance(module, SparseAutoEncoder) and module.mode == "splade"
+        ]
+        if not self._splade_saes:
+            logger.warning(
+                "SpladeDecoderNormalizationCallback registered, but the model contains no "
+                "SparseAutoEncoder(mode='splade') modules. The callback will have no effect."
+            )
+
+    def on_step_end(
+        self,
+        args: SparseEncoderTrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> None:
+        for sae in self._splade_saes:
+            sae.normalize_decoder_()
 
 
 class SchedulerType(Enum):
