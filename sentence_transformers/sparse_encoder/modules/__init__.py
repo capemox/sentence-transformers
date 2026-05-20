@@ -11,7 +11,7 @@ from .mlm_transformer import MLMTransformer
 from .sparse_auto_encoder import SparseAutoEncoder
 from .sparse_static_embedding import SparseStaticEmbedding
 from .splade_pooling import SpladePooling
-from .splade_sparse_auto_encoder import SpladeSparseAutoEncoder
+from .token_sparse_auto_encoder import TokenSparseAutoEncoder
 
 __all__ = [
     "Dense",
@@ -24,5 +24,5 @@ __all__ = [
     "SparseAutoEncoder",
     "SparseStaticEmbedding",
     "SpladePooling",
-    "SpladeSparseAutoEncoder",
+    "TokenSparseAutoEncoder",
 ]

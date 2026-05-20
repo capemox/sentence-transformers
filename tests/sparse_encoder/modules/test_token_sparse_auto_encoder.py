@@ -9,7 +9,7 @@ import torch
 from sentence_transformers import SparseEncoder
 from sentence_transformers.sparse_encoder.modules import (
     SpladePooling,
-    SpladeSparseAutoEncoder,
+    TokenSparseAutoEncoder,
     Transformer,
 )
 
@@ -20,10 +20,10 @@ BACKBONE = "sentence-transformers-testing/stsb-bert-tiny-safetensors"
 def sae_splade_model() -> SparseEncoder:
     """Build the canonical SAE-SPLADE pipeline on a tiny BERT.
 
-    ``Transformer(feature-extraction)`` -> :class:`SpladeSparseAutoEncoder` -> :class:`SpladePooling`.
+    ``Transformer(feature-extraction)`` -> :class:`TokenSparseAutoEncoder` -> :class:`SpladePooling`.
     """
     transformer = Transformer(BACKBONE, transformer_task="feature-extraction")
-    sae = SpladeSparseAutoEncoder(
+    sae = TokenSparseAutoEncoder(
         input_dim=transformer.get_embedding_dimension(),
         hidden_dim=64,
         k=4,
@@ -52,7 +52,7 @@ def test_subclass_relationship() -> None:
 
     # We deliberately subclass `SparseAutoEncoder` so the SAE math (pre-bias, tied decoder,
     # top-K, AuxK, dead-neuron stats) is shared, not duplicated.
-    assert issubclass(SpladeSparseAutoEncoder, SparseAutoEncoder)
+    assert issubclass(TokenSparseAutoEncoder, SparseAutoEncoder)
 
 
 @pytest.mark.parametrize(
@@ -103,7 +103,7 @@ def test_k_zero_disables_topk_mask() -> None:
     """``k=0`` is the SPLADE fine-tuning path: no top-K mask, sparsity comes from
     ReLU + log1p + max-pool only. Verify it (a) runs and (b) skips the AuxK output."""
     transformer = Transformer(BACKBONE, transformer_task="feature-extraction")
-    sae = SpladeSparseAutoEncoder(
+    sae = TokenSparseAutoEncoder(
         input_dim=transformer.get_embedding_dimension(),
         hidden_dim=32,
         k=0,
@@ -153,8 +153,8 @@ def test_save_and_reload(sae_splade_model: SparseEncoder, tmp_path) -> None:
         sae_splade_model.save_pretrained(out)
         reloaded = SparseEncoder(out)
 
-    assert any(isinstance(m, SpladeSparseAutoEncoder) for m in reloaded), (
-        "Reloaded modules.json must round-trip the SpladeSparseAutoEncoder class"
+    assert any(isinstance(m, TokenSparseAutoEncoder) for m in reloaded), (
+        "Reloaded modules.json must round-trip the TokenSparseAutoEncoder class"
     )
     after = _to_dense(reloaded.encode(inputs))
     torch.testing.assert_close(before, after)
@@ -165,7 +165,7 @@ def test_dead_neuron_stats_update(sae_splade_model: SparseEncoder) -> None:
     consults to find dead latents. Each training-mode forward must update it; the values
     must keep moving so dead latents can rotate in and out of the AuxK pool."""
     sae = sae_splade_model[1]
-    assert isinstance(sae, SpladeSparseAutoEncoder)
+    assert isinstance(sae, TokenSparseAutoEncoder)
     sae.stats_last_nonzero.zero_()
 
     inputs = sae_splade_model.preprocess(["dead neuron stats"])

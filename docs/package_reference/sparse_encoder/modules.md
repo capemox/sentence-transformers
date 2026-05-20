@@ -14,9 +14,9 @@ See also the modules from `sentence_transformers.base.modules` in [Base > Module
 .. autoclass:: sentence_transformers.sparse_encoder.modules.SparseAutoEncoder
 ```
 
-## SpladeSparseAutoEncoder
+## TokenSparseAutoEncoder
 ```{eval-rst}
-.. autoclass:: sentence_transformers.sparse_encoder.modules.SpladeSparseAutoEncoder
+.. autoclass:: sentence_transformers.sparse_encoder.modules.TokenSparseAutoEncoder
 ```
 
 ## SparseStaticEmbedding
