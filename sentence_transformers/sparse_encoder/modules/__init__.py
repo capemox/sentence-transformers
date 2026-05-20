@@ -7,6 +7,7 @@ from ...base.modules.input_module import InputModule
 from ...base.modules.module import Module
 from ...base.modules.router import Asym, Router
 from ...base.modules.transformer import Transformer
+from .mlm_transform import MLMTransform
 from .mlm_transformer import MLMTransformer
 from .sparse_auto_encoder import SparseAutoEncoder
 from .sparse_static_embedding import SparseStaticEmbedding
@@ -19,6 +20,7 @@ __all__ = [
     "Asym",
     "Router",
     "Transformer",
+    "MLMTransform",
     "MLMTransformer",
     "SparseAutoEncoder",
     "SparseStaticEmbedding",
