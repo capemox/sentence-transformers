@@ -8,8 +8,8 @@ import torch
 
 from sentence_transformers import SparseEncoder
 from sentence_transformers.sparse_encoder.modules import (
+    SparseAutoEncoder,
     SpladePooling,
-    TokenSparseAutoEncoder,
     Transformer,
 )
 
@@ -20,15 +20,16 @@ BACKBONE = "sentence-transformers-testing/stsb-bert-tiny-safetensors"
 def sae_splade_model() -> SparseEncoder:
     """Build the canonical SAE-SPLADE pipeline on a tiny BERT.
 
-    ``Transformer(feature-extraction)`` -> :class:`TokenSparseAutoEncoder` -> :class:`SpladePooling`.
+    ``Transformer(feature-extraction)`` -> :class:`SparseAutoEncoder` (mode=splade) -> :class:`SpladePooling`.
     """
     transformer = Transformer(BACKBONE, transformer_task="feature-extraction")
-    sae = TokenSparseAutoEncoder(
+    sae = SparseAutoEncoder(
         input_dim=transformer.get_embedding_dimension(),
         hidden_dim=64,
         k=4,
         k_aux=2,
         dead_threshold=2,
+        mode="splade",
     )
     pool = SpladePooling(pooling_strategy="max")
     return SparseEncoder(modules=[transformer, sae, pool])
@@ -47,12 +48,9 @@ def test_pipeline_shapes_and_sparsity(sae_splade_model: SparseEncoder) -> None:
     assert int((emb > 0).sum()) < emb.numel()
 
 
-def test_subclass_relationship() -> None:
-    from sentence_transformers.sparse_encoder.modules import SparseAutoEncoder
-
-    # We deliberately subclass `SparseAutoEncoder` so the SAE math (pre-bias, tied decoder,
-    # top-K, AuxK, dead-neuron stats) is shared, not duplicated.
-    assert issubclass(TokenSparseAutoEncoder, SparseAutoEncoder)
+def test_mode_argument_validation() -> None:
+    with pytest.raises(ValueError, match="mode must be"):
+        SparseAutoEncoder(input_dim=8, mode="not-a-mode")
 
 
 @pytest.mark.parametrize(
@@ -74,12 +72,13 @@ def test_subclass_relationship() -> None:
         ),
     ],
 )
-def test_training_intermediates_exposed(
+def test_training_intermediates_use_token_prefix(
     sae_splade_model: SparseEncoder, is_inference: bool, expected_extra_keys: set
 ) -> None:
-    """In training mode the SAE must expose the same family of intermediates as
-    :class:`SparseAutoEncoder` (just at the token level), so token-level SAE
-    reconstruction losses can be written against them."""
+    """In splade mode the training-time intermediates must be exposed under a
+    ``token_embeddings_*`` / ``decoded_token_embeddings_*`` prefix so they're
+    distinguishable from the csr-mode ``sentence_embedding_*`` outputs that downstream
+    losses are written against."""
     inputs = sae_splade_model.preprocess(["intermediate exposure test"])
     inputs = {k: v.to(sae_splade_model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
@@ -93,9 +92,8 @@ def test_training_intermediates_exposed(
     if not is_inference:
         seq_len = inputs["input_ids"].shape[1]
         hidden = sae_splade_model[0].get_embedding_dimension()
-        # Decoded tensors round-trip back to the backbone hidden size.
+        # Decoded tensors round-trip back to the backbone hidden size at the token level.
         assert tuple(out["decoded_token_embeddings_k"].shape) == (1, seq_len, hidden)
-        # AuxK has its own k_aux trailing dimension, dense over hidden_dim like top_k.
         assert out["auxiliary_token_embeddings"].shape[-1] == sae_splade_model[1].hidden_dim
 
 
@@ -103,11 +101,12 @@ def test_k_zero_disables_topk_mask() -> None:
     """``k=0`` is the SPLADE fine-tuning path: no top-K mask, sparsity comes from
     ReLU + log1p + max-pool only. Verify it (a) runs and (b) skips the AuxK output."""
     transformer = Transformer(BACKBONE, transformer_task="feature-extraction")
-    sae = TokenSparseAutoEncoder(
+    sae = SparseAutoEncoder(
         input_dim=transformer.get_embedding_dimension(),
         hidden_dim=32,
         k=0,
         k_aux=4,
+        mode="splade",
     )
     model = SparseEncoder(modules=[transformer, sae, SpladePooling(pooling_strategy="max")])
 
@@ -136,12 +135,11 @@ def test_max_active_dims_forward_kwarg(sae_splade_model: SparseEncoder) -> None:
         default = sae_splade_model(inputs)
         tighter = sae_splade_model(dict(inputs), max_active_dims=2)
 
-    # token_embeddings is the SAE output before pooling: count active latents per token.
     per_token_nnz_default = (default["token_embeddings"] > 0).sum(dim=-1)
     per_token_nnz_tighter = (tighter["token_embeddings"] > 0).sum(dim=-1)
     assert torch.all(per_token_nnz_default <= sae_splade_model[1].k)
     assert torch.all(per_token_nnz_tighter <= 2)
-    # And a tighter top-K can never enlarge the pooled vector's support.
+    # A tighter top-K can never enlarge the pooled vector's support.
     assert int((tighter["sentence_embedding"] > 0).sum()) <= int((default["sentence_embedding"] > 0).sum())
 
 
@@ -153,19 +151,19 @@ def test_save_and_reload(sae_splade_model: SparseEncoder, tmp_path) -> None:
         sae_splade_model.save_pretrained(out)
         reloaded = SparseEncoder(out)
 
-    assert any(isinstance(m, TokenSparseAutoEncoder) for m in reloaded), (
-        "Reloaded modules.json must round-trip the TokenSparseAutoEncoder class"
-    )
+    # ``mode`` is a config_key, so it must round-trip through modules.json.
+    reloaded_sae = next(m for m in reloaded if isinstance(m, SparseAutoEncoder))
+    assert reloaded_sae.mode == "splade"
     after = _to_dense(reloaded.encode(inputs))
     torch.testing.assert_close(before, after)
 
 
 def test_dead_neuron_stats_update(sae_splade_model: SparseEncoder) -> None:
-    """``stats_last_nonzero`` is the buffer the parent ``SparseAutoEncoder``'s AuxK mask
-    consults to find dead latents. Each training-mode forward must update it; the values
-    must keep moving so dead latents can rotate in and out of the AuxK pool."""
+    """``stats_last_nonzero`` is the buffer the AuxK mask consults to find dead latents.
+    Each training-mode forward must update it; the values must keep moving so dead
+    latents can rotate in and out of the AuxK pool."""
     sae = sae_splade_model[1]
-    assert isinstance(sae, TokenSparseAutoEncoder)
+    assert isinstance(sae, SparseAutoEncoder)
     sae.stats_last_nonzero.zero_()
 
     inputs = sae_splade_model.preprocess(["dead neuron stats"])

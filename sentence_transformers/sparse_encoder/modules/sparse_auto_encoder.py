@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 try:
     from typing import Self
 except ImportError:
@@ -10,6 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sentence_transformers.base.modules.module import Module
+
+SparseAutoEncoderMode = Literal["csr", "splade"]
 
 
 class TiedTranspose(nn.Module):
@@ -33,14 +37,30 @@ class TiedTranspose(nn.Module):
 
 class SparseAutoEncoder(Module):
     """
-    This module implements the Sparse AutoEncoder architecture based on the paper:
-    Beyond Matryoshka: Revisiting Sparse Coding for Adaptive Representation, https://huggingface.co/papers/2503.01776
+    This module implements the Sparse AutoEncoder architecture from
+    `Beyond Matryoshka: Revisiting Sparse Coding for Adaptive Representation
+    <https://huggingface.co/papers/2503.01776>`_, with an optional SAE-SPLADE
+    forward path from `From Tokens to Concepts: Leveraging SAE for SPLADE
+    <https://huggingface.co/papers/2604.21511>`_.
 
-    This module transforms dense embeddings into sparse representations by:
+    The encoder math is the same in both modes (pre-bias, tied decoder, top-K, AuxK,
+    dead-neuron stats); only the I/O contract differs:
 
-    1. Applying a multi-layer feed-forward network
-    2. Applying top-k sparsification to keep only the largest values
-    3. Supporting auxiliary losses for training stability (via k_aux parameter)
+    * ``mode="csr"`` (default) — the CSR pipeline. Reads a per-sentence vector from
+      ``features["sentence_embedding"]`` of shape ``(batch, input_dim)`` and writes a
+      top-K sparse vector back to the same key (shape ``(batch, hidden_dim)``).
+    * ``mode="splade"`` — the SAE-SPLADE pipeline. Reads per-token hidden states from
+      ``features["token_embeddings"]`` of shape ``(batch, seq_length, input_dim)`` and
+      writes top-K SAE latents back to the same key (shape
+      ``(batch, seq_length, hidden_dim)``), ready for a downstream
+      :class:`SpladePooling`. In this mode ``k=0`` (or any value ``>= hidden_dim``)
+      skips the top-K mask entirely — sparsity is then produced by the downstream
+      ReLU + log1p + max-pool, as in the SPLADE fine-tuning phase of the paper.
+
+    Training-mode forward exposes the usual reconstruction / auxiliary intermediates
+    under prefixes that match the mode (``sentence_embedding_*`` /
+    ``decoded_embedding_*`` for csr, ``token_embeddings_*`` /
+    ``decoded_token_embeddings_*`` for splade).
 
     Args:
         input_dim: Dimension of the input embeddings.
@@ -49,11 +69,41 @@ class SparseAutoEncoder(Module):
         k_aux: Number of top values to keep for auxiliary loss calculation. Defaults to 512.
         normalize: Whether to apply layer normalization to the input embeddings. Defaults to False.
         dead_threshold: Threshold for dead neurons. Neurons with non-zero activations below this threshold are considered dead. Defaults to 30.
+        mode: Which forward path to use — ``"csr"`` (default, sentence-level CSR pipeline)
+            or ``"splade"`` (token-level SAE-SPLADE pipeline). The choice is persisted in
+            the config so saved models round-trip correctly.
     """
 
-    config_keys = ["input_dim", "hidden_dim", "k", "k_aux", "normalize", "dead_threshold"]
+    config_keys = ["input_dim", "hidden_dim", "k", "k_aux", "normalize", "dead_threshold", "mode"]
 
     forward_kwargs = {"max_active_dims"}
+
+    # Feature dict key conventions per mode. ``input`` is the key the SAE reads from and
+    # writes its top-K output back to; the rest are the training-mode intermediates.
+    _FEATURE_KEYS: dict[str, dict[str, str]] = {
+        "csr": {
+            "input": "sentence_embedding",
+            "backbone": "sentence_embedding_backbone",
+            "encoded": "sentence_embedding_encoded",
+            "encoded_4k": "sentence_embedding_encoded_4k",
+            "auxiliary": "auxiliary_embedding",
+            "decoded_k": "decoded_embedding_k",
+            "decoded_4k": "decoded_embedding_4k",
+            "decoded_aux": "decoded_embedding_aux",
+            "decoded_k_pre_bias": "decoded_embedding_k_pre_bias",
+        },
+        "splade": {
+            "input": "token_embeddings",
+            "backbone": "token_embeddings_backbone",
+            "encoded": "token_embeddings_encoded",
+            "encoded_4k": "token_embeddings_encoded_4k",
+            "auxiliary": "auxiliary_token_embeddings",
+            "decoded_k": "decoded_token_embeddings_k",
+            "decoded_4k": "decoded_token_embeddings_4k",
+            "decoded_aux": "decoded_token_embeddings_aux",
+            "decoded_k_pre_bias": "decoded_token_embeddings_k_pre_bias",
+        },
+    }
 
     def __init__(
         self,
@@ -63,8 +113,11 @@ class SparseAutoEncoder(Module):
         k_aux: int = 512,
         normalize: bool = False,
         dead_threshold: int = 30,
+        mode: SparseAutoEncoderMode = "csr",
     ) -> None:
         super().__init__()
+        if mode not in self._FEATURE_KEYS:
+            raise ValueError(f"mode must be one of {sorted(self._FEATURE_KEYS)}, got {mode!r}")
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.dead_threshold = dead_threshold
@@ -75,6 +128,7 @@ class SparseAutoEncoder(Module):
         self.k = k
         self.k_aux = k_aux
         self.normalize = normalize
+        self.mode = mode
 
         self.stats_last_nonzero: torch.Tensor
         self.register_buffer("stats_last_nonzero", torch.zeros(hidden_dim, dtype=torch.long))
@@ -158,45 +212,57 @@ class SparseAutoEncoder(Module):
             ret = ret * info["std"] + info["mu"]
         return ret
 
+    def _topk_disabled(self, k: int) -> bool:
+        # ``mode="splade"`` only: a non-positive ``k`` (or one as wide as the dictionary)
+        # means "no top-K mask" — the downstream SpladePooling enforces sparsity instead.
+        return k <= 0 or k >= self.hidden_dim
+
     def forward(
         self, features: dict[str, torch.Tensor], max_active_dims: int | None = None
     ) -> dict[str, torch.Tensor]:
         k = max_active_dims if max_active_dims is not None else self.k
-        x = features["sentence_embedding"]
-
-        # If the model is in inference mode, we don't need to e.g. compute the 4k, auxk, or apply the decoder
-        if torch.is_inference_mode_enabled():
-            x, info = self.prepare(x)
-            latents_pre_act = self.encode_pre_act(x)
-            latents_k, _ = self.top_k(latents_pre_act, k, compute_aux=False)
-            features["sentence_embedding"] = latents_k
-            return features
+        keys = self._FEATURE_KEYS[self.mode]
+        x = features[keys["input"]]
 
         x, info = self.prepare(x)
         latents_pre_act = self.encode_pre_act(x)
 
-        latents_k, latents_auxk = self.top_k(latents_pre_act, k)
-        latents_4k, _ = self.top_k(latents_pre_act, 4 * k)
+        # In splade mode the user may skip the top-K mask entirely; csr mode always uses
+        # top-K because top-K is the only thing producing sparsity in that pipeline.
+        skip_topk = self.mode == "splade" and self._topk_disabled(k)
+
+        # If the model is in inference mode, we don't need to e.g. compute the 4k, auxk, or apply the decoder
+        if torch.is_inference_mode_enabled():
+            latents_k = torch.relu(latents_pre_act) if skip_topk else self.top_k(latents_pre_act, k, compute_aux=False)[0]
+            features[keys["input"]] = latents_k
+            return features
+
+        if skip_topk:
+            latents_k = torch.relu(latents_pre_act)
+            latents_4k = latents_k
+            latents_auxk = None
+        else:
+            latents_k, latents_auxk = self.top_k(latents_pre_act, k)
+            latents_4k, _ = self.top_k(latents_pre_act, min(4 * k, self.hidden_dim))
 
         recons_k = self.decode(latents_k, info)
         recons_4k = self.decode(latents_4k, info)
-
-        recons_aux = self.decode(latents_auxk, info)
+        recons_aux = self.decode(latents_auxk, info) if latents_auxk is not None else None
 
         # Update the features dictionary
         features.update(
             {
-                "sentence_embedding_backbone": x,
-                "sentence_embedding_encoded": latents_pre_act,
-                "sentence_embedding_encoded_4k": latents_4k,
-                "auxiliary_embedding": latents_auxk,
-                "decoded_embedding_k": recons_k,
-                "decoded_embedding_4k": recons_4k,
-                "decoded_embedding_aux": recons_aux,
-                "decoded_embedding_k_pre_bias": recons_k - self.pre_bias,
+                keys["backbone"]: x,
+                keys["encoded"]: latents_pre_act,
+                keys["encoded_4k"]: latents_4k,
+                keys["auxiliary"]: latents_auxk,
+                keys["decoded_k"]: recons_k,
+                keys["decoded_4k"]: recons_4k,
+                keys["decoded_aux"]: recons_aux,
+                keys["decoded_k_pre_bias"]: recons_k - self.pre_bias,
             }
         )
-        features["sentence_embedding"] = latents_k
+        features[keys["input"]] = latents_k
         return features
 
     def save(self, output_path, safe_serialization: bool = True) -> None:
